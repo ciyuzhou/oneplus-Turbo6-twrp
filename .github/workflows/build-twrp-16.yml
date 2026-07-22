@@ -1,0 +1,179 @@
+name: Build TWRP 16 for OnePlus Turbo 6
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-twrp-16.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: twrp16-oneplus-turbo6
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build recovery.img
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      MANIFEST_URL: https://github.com/TWRP-Test/platform_manifest_twrp_aosp.git
+      MANIFEST_BRANCH: twrp-16.0
+      MANIFEST_COMMIT: 512614e74d5a65f7b11fbd0b424f0d68b5ef7fe1
+      DEVICE_TREE_URL: https://github.com/kmiit/twrp_device_oplus_sm87xx.git
+      DEVICE_TREE_BRANCH: twrp-16.0
+      DEVICE_TREE_COMMIT: 74d075623b35f685fcde82efb5a43548697d1a6e
+      TURBO6_TOUCH_COMMIT: dd7a43fdb13c4440df99fbe145bead37e5435aef
+      DEVICE_PATH: device/oplus/sm87xx
+      PRODUCT_NAME: sm87xx
+      LUNCH_TARGET: twrp_sm87xx
+      BUILD_TARGET: recoveryimage
+      TZ: UTC
+
+    steps:
+      # These are the same space-recovery actions used by the device-tree
+      # maintainer's successful workflow, pinned to immutable commits.
+      - name: Reclaim runner disk space
+        uses: rokibhasansagar/slimhub_actions@c2a6e4317d3de2b623ac7395b05e9d2149e8289b
+
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@c28619d8999a147d5e09c1199f84ff6af6ad5794
+
+      - name: Restore compiler cache
+        uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639
+        with:
+          key: twrp16-sm87xx
+          max-size: 5G
+          create-symlink: true
+
+      - name: Configure zram
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" zram-tools
+          sudo modprobe zram
+          sudo sed -i 's/^#\?PERCENT=.*/PERCENT=90/' /etc/default/zramswap
+          sudo sed -i 's/^#\?PRIORITY=.*/PRIORITY=1000/' /etc/default/zramswap
+          sudo systemctl restart zramswap
+          zramctl
+
+      - name: Install repo launcher
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get install -y repo
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Initialize and pin TWRP 16 manifest
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/source"
+          cd "$GITHUB_WORKSPACE/source"
+          repo init \
+            --depth=1 \
+            --no-clone-bundle \
+            -u "$MANIFEST_URL" \
+            -b "$MANIFEST_BRANCH"
+
+          git -C .repo/manifests fetch --depth=1 origin "$MANIFEST_COMMIT"
+          git -C .repo/manifests checkout --detach "$MANIFEST_COMMIT"
+          test "$(git -C .repo/manifests rev-parse HEAD)" = "$MANIFEST_COMMIT"
+
+      - name: Sync TWRP source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/source"
+          repo sync \
+            --current-branch \
+            --force-sync \
+            --no-clone-bundle \
+            --no-tags \
+            --retry-fetches=3 \
+            -j"$(nproc)"
+          test "$(git -C .repo/manifests rev-parse HEAD)" = "$MANIFEST_COMMIT"
+
+      - name: Fetch and verify Turbo 6 device tree
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/source"
+          git clone --depth=2 --branch "$DEVICE_TREE_BRANCH" \
+            "$DEVICE_TREE_URL" "$DEVICE_PATH"
+          git -C "$DEVICE_PATH" fetch --depth=2 origin "$DEVICE_TREE_COMMIT"
+          git -C "$DEVICE_PATH" checkout --detach "$DEVICE_TREE_COMMIT"
+
+          test "$(git -C "$DEVICE_PATH" rev-parse HEAD)" = "$DEVICE_TREE_COMMIT"
+          git -C "$DEVICE_PATH" merge-base --is-ancestor \
+            "$TURBO6_TOUCH_COMMIT" "$DEVICE_TREE_COMMIT"
+          grep -Fq "OnePlus Turbo 6 (CN)" "$DEVICE_PATH/README.md"
+
+      - name: Record exact source revisions
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/source"
+          repo manifest -r -o pinned-manifest.xml
+          {
+            echo "Device: OnePlus Turbo 6 CN (PLU110, volkswagen/vw)"
+            echo "Android/TWRP branch: twrp-16.0"
+            echo "Manifest commit: $MANIFEST_COMMIT"
+            echo "Device tree commit: $DEVICE_TREE_COMMIT"
+            echo "Turbo 6 touch support commit: $TURBO6_TOUCH_COMMIT"
+            echo "GitHub run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Build started (UTC): $(date -u --iso-8601=seconds)"
+          } > BUILD_INFO.txt
+
+      - name: Build TWRP recovery image
+        shell: bash
+        run: |
+          set -exo pipefail
+          cd "$GITHUB_WORKSPACE/source"
+          source build/envsetup.sh
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export USE_CCACHE=1
+          export CCACHE_EXEC="$(command -v ccache)"
+          export CCACHE_DIR="$HOME/.ccache"
+          export CCACHE_MAXSIZE=5G
+          ccache -M 5G
+
+          lunch "$LUNCH_TARGET"
+          m "$BUILD_TARGET"
+
+      - name: Validate and stage output
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/source"
+          image="out/target/product/$PRODUCT_NAME/recovery.img"
+          test -s "$image"
+
+          # The device tree declares a 0x6400000-byte recovery partition.
+          test "$(stat -c '%s' "$image")" -le 104857600
+          file "$image" | grep -Fq "Android bootimg"
+
+          output="$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$output"
+          name="TWRP-3.7.1-16-OnePlus-Turbo6-PLU110-${GITHUB_RUN_ID}.img"
+          cp "$image" "$output/$name"
+          cp BUILD_INFO.txt pinned-manifest.xml "$output/"
+          (
+            cd "$output"
+            sha256sum "$name" > SHA256SUMS.txt
+          )
+          cat "$output/SHA256SUMS.txt"
+
+      - name: Upload recovery image
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: TWRP-16-OnePlus-Turbo6-PLU110-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 14
