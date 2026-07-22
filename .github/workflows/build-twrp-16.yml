@@ -81,8 +81,9 @@ jobs:
             -u "$MANIFEST_URL" \
             -b "$MANIFEST_BRANCH"
 
-          git -C .repo/manifests fetch --depth=1 origin "$MANIFEST_COMMIT"
-          git -C .repo/manifests checkout --detach "$MANIFEST_COMMIT"
+          # Keep repo's local "default" branch checked out. Detaching HEAD here
+          # makes repo lose the manifest branch and fall back to "master".
+          test "$(git -C .repo/manifests branch --show-current)" = "default"
           test "$(git -C .repo/manifests rev-parse HEAD)" = "$MANIFEST_COMMIT"
 
       - name: Sync TWRP source
