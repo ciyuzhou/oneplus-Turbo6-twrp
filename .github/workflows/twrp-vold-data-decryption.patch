@@ -1,0 +1,242 @@
+diff --git a/Android.bp b/Android.bp
+index c06743b..31cd2bf 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -122,6 +122,7 @@ cc_library_static {
+         "vold_defaults"
+     ],
+     include_dirs: [
++        "external/sqlite/dist/",
+         "system/core/gatekeeperd/include"
+     ],
+     srcs: [
+@@ -197,6 +198,7 @@ cc_library_static {
+         "libkeystore-attestation-application-id",
+         "libkeymint_support",
+         "libkeyutils",
++        "libsqlite",
+     ],
+     static_libs: [
+         "vold_flags_c_lib",
+@@ -388,4 +390,4 @@ aconfig_declarations {
+ cc_aconfig_library {
+     name: "vold_flags_c_lib",
+     aconfig_declarations: "vold_flags",
+-}
+\ No newline at end of file
++}
+diff --git a/Decrypt.cpp b/Decrypt.cpp
+index a02bad8..8c24ed4 100755
+--- a/Decrypt.cpp
++++ b/Decrypt.cpp
+@@ -44,6 +44,9 @@
+ #include <future>
+ #include <algorithm>
+ #include <chrono>
++#include <limits>
++
++#include <sqlite3.h>
+ 
+ #include <android/binder_manager.h>
+ #include <android-base/file.h>
+@@ -428,14 +431,29 @@ bool Get_Weaver_Data(const std::string& spblob_path, const std::string& handle_s
+ 		printf("Get_Weaver_Data: No weaver file found for %s\n", handle_str.c_str());
+ 		return found_file;
+ 	} else {
+-		// output_hex(weaver_data.data(), weaver_data.size());printf("\n");
+-		const unsigned char* byteptr = (const unsigned char*)weaver_data.data();
+-		wd->version = *byteptr;
+-		// printf("weaver version %i\n", wd->version);
+-		const int* intptr = (const int*)weaver_data.data() + sizeof(unsigned char);
+-		wd->slot = *intptr;
+-		//endianswap(&wd->slot); not needed
+-		// printf("weaver slot %i\n", wd->slot);
++		// SyntheticPasswordManager writes one version byte followed by a
++		// big-endian int32 slot.  Do not cast an unaligned pointer here: apart
++		// from being undefined behaviour, the old expression advanced by four
++		// bytes instead of one and read past this five-byte file.
++		if (weaver_data.size() != 5) {
++			printf("Invalid weaver data size %zu\n", weaver_data.size());
++			return false;
++		}
++		const auto* bytes = reinterpret_cast<const unsigned char*>(weaver_data.data());
++		wd->version = bytes[0];
++		if (wd->version != 1) {
++			printf("Unsupported weaver data version %u\n", wd->version);
++			return false;
++		}
++		const uint32_t slot = (static_cast<uint32_t>(bytes[1]) << 24) |
++				(static_cast<uint32_t>(bytes[2]) << 16) |
++				(static_cast<uint32_t>(bytes[3]) << 8) |
++				static_cast<uint32_t>(bytes[4]);
++		if (slot > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
++			printf("Invalid weaver slot %u\n", slot);
++			return false;
++		}
++		wd->slot = static_cast<int>(slot);
+ 	}
+ 	return found_file;
+ }
+@@ -491,16 +509,86 @@ namespace keystore {
+ 		}
+ 	}
+ 
++	static bool waitForProperty(const char* name, const char* expected, int retries) {
++		char value[PROPERTY_VALUE_MAX] = {};
++		while (retries-- > 0) {
++			property_get(name, value, "");
++			if (strcmp(value, expected) == 0) return true;
++			usleep(250000);
++		}
++		printf("Timed out waiting for %s=%s (last value '%s')\n", name, expected, value);
++		return false;
++	}
++
++	static bool backupSqliteDb(const char* src, const char* dst) {
++		sqlite3* source = nullptr;
++		sqlite3* destination = nullptr;
++		sqlite3_backup* backup = nullptr;
++		int rc = sqlite3_open_v2(src, &source, SQLITE_OPEN_READONLY, nullptr);
++		if (rc == SQLITE_OK) rc = sqlite3_open(dst, &destination);
++		if (rc == SQLITE_OK) {
++			backup = sqlite3_backup_init(destination, "main", source, "main");
++			if (backup == nullptr) {
++				rc = sqlite3_errcode(destination);
++			} else {
++				rc = sqlite3_backup_step(backup, -1);
++				if (rc == SQLITE_DONE) rc = SQLITE_OK;
++				const int finish_rc = sqlite3_backup_finish(backup);
++				if (rc == SQLITE_OK) rc = finish_rc;
++			}
++		}
++		if (destination != nullptr) sqlite3_close(destination);
++		if (source != nullptr) sqlite3_close(source);
++		if (rc != SQLITE_OK) {
++			printf("Failed to back up keystore database (SQLite error %d)\n", rc);
++			return false;
++		}
++		return true;
++	}
++
+ 	void copySqliteDb() {
+-		std::string keystore_path = "/tmp/misc/keystore/";
+-		std::string dst = keystore_path + "persistent.sqlite";
+-		std::string src = "/data/misc/keystore/persistent.sqlite";
+-		std::ifstream srcif(src.c_str(), std::ios::binary);
+-		std::ofstream dstof(dst.c_str(), std::ios::binary);
+-		printf("copying '%s' to '%s'\n", src.c_str(), dst.c_str());
+-		dstof << srcif.rdbuf();
+-		srcif.close();
+-		dstof.close();
++		const char* src = "/data/misc/keystore/persistent.sqlite";
++		const char* dst = "/tmp/misc/keystore/persistent.sqlite";
++		struct stat st;
++		char ready[PROPERTY_VALUE_MAX] = {};
++		property_get("twrp.keystore.db_ready", ready, "0");
++		if (strcmp(ready, "1") == 0 && stat(dst, &st) == 0) return;
++		if (stat(src, &st) != 0) {
++			printf("Keystore database is not available yet: %s\n", strerror(errno));
++			return;
++		}
++
++		char setpatch[PROPERTY_VALUE_MAX] = {};
++		property_get("prepdecrypt.setpatch", setpatch, "false");
++		if (strcmp(setpatch, "true") == 0 &&
++				!waitForProperty("crypto.ready", "1", 120)) {
++			return;
++		}
++
++		property_set("twrp.keystore.db_ready", "0");
++		property_set("ctl.stop", "keystore2");
++		if (!waitForProperty("init.svc.keystore2", "stopped", 40)) return;
++		unlink(dst);
++		unlink("/tmp/misc/keystore/persistent.sqlite-wal");
++		unlink("/tmp/misc/keystore/persistent.sqlite-shm");
++		printf("Backing up '%s' to '%s'\n", src, dst);
++		const bool backup_ok = backupSqliteDb(src, dst);
++		if (backup_ok) chmod(dst, 0600);
++
++		property_set("ctl.start", "keystore2");
++		if (!waitForProperty("init.svc.keystore2", "running", 80)) return;
++		if (!backup_ok) return;
++		for (int retry = 0; retry < 80; ++retry) {
++			::ndk::SpAIBinder binder(AServiceManager_checkService(
++					"android.system.keystore2.IKeystoreService/default"));
++			if (binder.get() != nullptr) {
++				property_set("twrp.keystore.db_ready", "1");
++				printf("Keystore database reload complete\n");
++				return;
++			}
++			usleep(250000);
++		}
++		printf("Timed out waiting for the keystore2 binder service\n");
+ 	}
+ 
+ 	/* C++ replacement for function of the same name
+@@ -570,6 +658,10 @@ namespace keystore {
+ 
+ 			ks2::KeyEntryResponse keyEntryResponse;
+ 			::ndk::SpAIBinder keystoreBinder(AServiceManager_checkService("android.system.keystore2.IKeystoreService/default"));
++			if (keystoreBinder.get() == nullptr) {
++				printf("keystore2 binder service is unavailable\n");
++				return disk_decryption_secret_key;
++			}
+ 			auto keystore = ks2::IKeystoreService::fromBinder(keystoreBinder);
+ 			auto rc = keystore->getKeyEntry(keyDescriptor(keystore_alias), &keyEntryResponse);
+ 			if (!rc.isOk()) {
+@@ -751,7 +843,6 @@ bool Decrypt_User_Synth_Pass(const userid_t user_id, const std::string& Password
+ 			return Free_Return(retval, weaver_key, &pwd);
+ 		}
+ 	} else {
+-		android::keystore::copySqliteDb(); // early copy db for keystore
+ 		std::string defpassword = "default-password";
+ 		memcpy(password_token, defpassword.data(), defpassword.length());
+ 	}
+@@ -1027,6 +1118,9 @@ extern "C" bool Decrypt_User(const userid_t user_id, const std::string& Password
+ 		printf("user_id is too big\n");
+ 		return false;
+ 	}
++	// The initial TWRP call can happen before /data or the vendor crypto HALs
++	// are ready.  Retry here once the user actually submits a credential.
++	android::keystore::copySqliteDb();
+     std::string filename;
+     bool Default_Password = (Password == "!");
+     if (Get_Password_Type(user_id, filename) == 0 && !Default_Password) {
+diff --git a/Weaver1.cpp b/Weaver1.cpp
+index a2eeaaa..7ba75db 100644
+--- a/Weaver1.cpp
++++ b/Weaver1.cpp
+@@ -34,6 +34,7 @@
+ #include <aidl/android/hardware/weaver/IWeaver.h>
+ 
+ #include <iostream>
++#include <unistd.h>
+ #define ERROR 1
+ #define LOG(x) std::cout
+ 
+@@ -65,11 +66,21 @@ bool Weaver::GetConfig() {
+ 		return true;
+ 
+ 	if (mAidlDevice != nullptr) {
+-		auto r = mAidlDevice->getConfig(&aidlConfig);
+-		if (r.isOk()) {
+-			GottenConfig = true;
+-			return true;
++		// Android 16 devices can publish the Weaver binder before StrongBox has
++		// finished initializing.  Give the HAL time to return a usable config.
++		for (int attempt = 1; attempt <= 80; ++attempt) {
++			auto r = mAidlDevice->getConfig(&aidlConfig);
++			if (r.isOk() && aidlConfig.slots > 0 && aidlConfig.keySize > 0 &&
++					aidlConfig.valueSize > 0) {
++				GottenConfig = true;
++				return true;
++			}
++			if (attempt == 1 || attempt % 10 == 0) {
++				LOG(ERROR) << "Waiting for Weaver config (attempt " << attempt << "/80)\n";
++			}
++			usleep(250000);
+ 		}
++		LOG(ERROR) << "Weaver config did not become ready\n";
+ 		return false;
+ 	}
+ 

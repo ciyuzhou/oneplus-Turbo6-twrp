@@ -1,0 +1,43 @@
+diff --git a/recovery/root/vendor/bin/override-spl.sh b/recovery/root/vendor/bin/override-spl.sh
+index 17b6de5..dd902fa 100644
+--- a/recovery/root/vendor/bin/override-spl.sh
++++ b/recovery/root/vendor/bin/override-spl.sh
+@@ -72,7 +72,36 @@ SearchAndOverrideProp(){
+ SearchAndOverrideProp "/vendor_temp" "$DYNAMICVEN" "ro.vendor.build.security_patch"
+ SearchAndOverrideProp "/system_temp" "$DYNAMICSYS" "ro.build.version.security_patch"
+ 
++# KeyMint reads the framework/vendor security patch levels at startup and uses
++# them for version-bound keys.  It was started with the BoardConfig 2099 SPL,
++# so restart it after publishing the real installed-ROM values.
++log "Restarting KeyMint and keystore2 with the installed ROM security patch levels"
++stop keystore2
++stop vendor.keymint-qti
++start vendor.keymint-qti
++
++RETRY=40
++while [ "$(getprop init.svc.vendor.keymint-qti)" != "running" ] && [ "$RETRY" -gt 0 ]; do
++	sleep 0.25
++	RETRY=$((RETRY - 1))
++done
++if [ "$(getprop init.svc.vendor.keymint-qti)" != "running" ]; then
++	log "KeyMint failed to restart; refusing to mark crypto ready"
++	exit 1
++fi
++
++start keystore2
++RETRY=40
++while [ "$(getprop init.svc.keystore2)" != "running" ] && [ "$RETRY" -gt 0 ]; do
++	sleep 0.25
++	RETRY=$((RETRY - 1))
++done
++if [ "$(getprop init.svc.keystore2)" != "running" ]; then
++	log "keystore2 failed to restart; refusing to mark crypto ready"
++	exit 1
++fi
++
+ setprop crypto.ready 1
+ log "crypto.ready 1"
+ 
+-exit 0
+\ No newline at end of file
++exit 0
