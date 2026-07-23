@@ -5,6 +5,8 @@ on:
   push:
     paths:
       - ".github/workflows/build-twrp-16.yml"
+      - "patches/**"
+      - "README.md"
 
 permissions:
   contents: read
@@ -23,6 +25,7 @@ jobs:
       MANIFEST_URL: https://github.com/TWRP-Test/platform_manifest_twrp_aosp.git
       MANIFEST_BRANCH: twrp-16.0
       MANIFEST_COMMIT: 512614e74d5a65f7b11fbd0b424f0d68b5ef7fe1
+      VOLD_COMMIT: 953de9608eb78380b3c4e39e801c2bc0af7dbddc
       DEVICE_TREE_URL: https://github.com/kmiit/twrp_device_oplus_sm87xx.git
       DEVICE_TREE_BRANCH: twrp-16.0
       DEVICE_TREE_COMMIT: 74d075623b35f685fcde82efb5a43548697d1a6e
@@ -41,6 +44,9 @@ jobs:
 
       - name: Maximize build space
         uses: easimon/maximize-build-space@c28619d8999a147d5e09c1199f84ff6af6ad5794
+
+      - name: Check out builder and decryption patches
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Restore compiler cache
         uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639
@@ -100,6 +106,25 @@ jobs:
             -j"$(nproc)"
           test "$(git -C .repo/manifests rev-parse HEAD)" = "$MANIFEST_COMMIT"
 
+      - name: Pin and patch TWRP vold decryption
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/source"
+          git -C system/vold fetch --depth=1 origin "$VOLD_COMMIT"
+          git -C system/vold checkout --detach "$VOLD_COMMIT"
+          test "$(git -C system/vold rev-parse HEAD)" = "$VOLD_COMMIT"
+
+          patch="$GITHUB_WORKSPACE/patches/twrp-vold-data-decryption.patch"
+          git -C system/vold apply --check "$patch"
+          git -C system/vold apply "$patch"
+          git -C system/vold diff --check
+          git -C system/vold apply --reverse --check "$patch"
+
+          grep -Fq 'Keystore database reload complete' system/vold/Decrypt.cpp
+          grep -Fq 'Invalid weaver data size' system/vold/Decrypt.cpp
+          grep -Fq 'Waiting for Weaver config' system/vold/Weaver1.cpp
+
       - name: Fetch and verify Turbo 6 device tree
         shell: bash
         run: |
@@ -115,6 +140,14 @@ jobs:
             "$TURBO6_TOUCH_COMMIT" "$DEVICE_TREE_COMMIT"
           grep -Fq "OnePlus Turbo 6 (CN)" "$DEVICE_PATH/README.md"
 
+          patch="$GITHUB_WORKSPACE/patches/device-tree-crypto-init.patch"
+          git -C "$DEVICE_PATH" apply --check "$patch"
+          git -C "$DEVICE_PATH" apply "$patch"
+          git -C "$DEVICE_PATH" diff --check
+          git -C "$DEVICE_PATH" apply --reverse --check "$patch"
+          grep -Fq 'Restarting KeyMint and keystore2' \
+            "$DEVICE_PATH/recovery/root/vendor/bin/override-spl.sh"
+
       - name: Record exact source revisions
         shell: bash
         run: |
@@ -125,8 +158,11 @@ jobs:
             echo "Device: OnePlus Turbo 6 CN (PLU110, volkswagen/vw)"
             echo "Android/TWRP branch: twrp-16.0"
             echo "Manifest commit: $MANIFEST_COMMIT"
+            echo "system/vold commit: $VOLD_COMMIT"
             echo "Device tree commit: $DEVICE_TREE_COMMIT"
             echo "Turbo 6 touch support commit: $TURBO6_TOUCH_COMMIT"
+            echo "vold decryption patch SHA-256: $(sha256sum "$GITHUB_WORKSPACE/patches/twrp-vold-data-decryption.patch" | cut -d' ' -f1)"
+            echo "device crypto-init patch SHA-256: $(sha256sum "$GITHUB_WORKSPACE/patches/device-tree-crypto-init.patch" | cut -d' ' -f1)"
             echo "GitHub run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             echo "Build started (UTC): $(date -u --iso-8601=seconds)"
           } > BUILD_INFO.txt
@@ -164,6 +200,7 @@ jobs:
           name="TWRP-3.7.1-16-OnePlus-Turbo6-PLU110-${GITHUB_RUN_ID}.img"
           cp "$image" "$output/$name"
           cp BUILD_INFO.txt pinned-manifest.xml "$output/"
+          cp "$GITHUB_WORKSPACE"/patches/*.patch "$output/"
           (
             cd "$output"
             sha256sum "$name" > SHA256SUMS.txt
