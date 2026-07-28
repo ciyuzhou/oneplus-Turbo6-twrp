@@ -18,13 +18,49 @@
 
 - `BUILD_INFO.txt`：关键源码版本和运行链接；
 - `pinned-manifest.xml`：本次构建实际使用的全部源码版本；
+- 两个 `*.patch`：本次使用的 data 解密修复源码补丁；
 - `SHA256SUMS.txt`：镜像的 SHA-256 校验值。
+
+## data 解密修复
+
+本构建器针对“锁屏密码正确，但 TWRP 无法解密 `/data`”修复了三处启动时序和
+解析问题：
+
+- `/data` 挂载后使用 SQLite backup API（包含 WAL 中的数据）复制 Android 16
+  的 keystore2 数据库，并重启 keystore2 让它重新打开正确的数据库；每次提交
+  解锁凭据时也会补做一次就绪检查，避免首次调用发生得过早；
+- 按 Android 的大端序格式安全解析 5 字节 Weaver slot 文件，并为尚未就绪的
+  StrongBox/Weaver HAL 增加最多 20 秒的重试；
+- 设备树先从当前已安装的 ColorOS 读取真实 framework/vendor 安全补丁级别，
+  然后重启 QTI KeyMint 和 keystore2，避免它们继续使用构建时占位的 `2099-12-31`
+  安全补丁级别处理版本绑定密钥。
+
+工作流把 `system/vold` 固定在补丁对应的精确提交，并在编译前执行正向、反向
+补丁校验；上游源码变化导致补丁不再精确匹配时，构建会直接失败而不是生成一个
+看似成功但没有修复的镜像。
+
+### 真机验证
+
+刷写前请先阅读下方安全说明。启动新镜像后输入当前系统的锁屏 PIN/密码，并确认
+`/data/media/0` 能显示真实文件名。若仍失败，在**本次 recovery 启动期间**保存日志：
+
+```sh
+adb pull /tmp/recovery.log
+adb shell getprop crypto.ready
+adb shell getprop init.svc.vendor.keymint-qti
+adb shell getprop init.svc.keystore2
+```
+
+提交问题时请同时注明 ColorOS 完整版本、锁屏类型（PIN/密码/图案）和上述三个属性
+的输出；公开日志前先检查其中是否包含文件名等隐私信息。
 
 ## 固定的上游版本
 
 - TWRP 16 manifest：`TWRP-Test/platform_manifest_twrp_aosp`，分支
   `twrp-16.0`，manifest 提交
   `512614e74d5a65f7b11fbd0b424f0d68b5ef7fe1`；
+- TWRP `system/vold`：提交
+  `953de9608eb78380b3c4e39e801c2bc0af7dbddc`；
 - 设备树：`kmiit/twrp_device_oplus_sm87xx`，分支 `twrp-16.0`，提交
   `74d075623b35f685fcde82efb5a43548697d1a6e`；
 - Turbo 6 触控支持：提交
