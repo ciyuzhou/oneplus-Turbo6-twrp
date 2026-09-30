@@ -1,4 +1,4 @@
-name: Build TWRP 16 for OnePlus Turbo 6
+name: Build TWRP 16 for OnePlus Turbo 6 (sm87xx)
 
 on:
   workflow_dispatch:
@@ -22,10 +22,10 @@ on:
       - "README.md"
 
 permissions:
-  contents: write          # 改为 write，用于 Release
+  contents: write
 
 concurrency:
-  group: twrp16-oneplus-turbo6-${{ github.ref }}
+  group: twrp16-oneplus-turbo6-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -47,20 +47,138 @@ jobs:
       PRODUCT_NAME: sm87xx
       LUNCH_TARGET: twrp_sm87xx
       TZ: UTC
+      SHOULD_RELEASE: ${{ github.event.inputs.SHOULD_RELEASE || 'false' }}
+      DEVICE_NAME: ${{ github.event.inputs.DEVICE_NAME || 'sm87xx' }}
+      BUILD_PARTITION: ${{ github.event.inputs.BUILD_PARTITION || 'recovery' }}
 
     steps:
-      # ... 前面的步骤与 Turbo6 工作流完全一致 ...
-      # 1. Reclaim runner disk space
-      # 2. Maximize build space
-      # 3. Check out builder and decryption patches
-      # 4. Restore compiler cache
-      # 5. Configure zram
-      # 6. Install repo launcher
-      # 7. Initialize and pin TWRP 16 manifest
-      # 8. Sync TWRP source
-      # 9. Pin and patch TWRP vold decryption
-      # 10. Fetch and verify Turbo 6 device tree
-      # 11. Record exact source revisions
+      - name: Reclaim runner disk space
+        uses: rokibhasansagar/slimhub_actions@c2a6e4317d3de2b623ac7395b05e9d2149e8289b
+
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@c28619d8999a147d5e09c1199f84ff6af6ad5794
+
+      - name: Check out builder and decryption patches
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Restore compiler cache
+        uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639
+        with:
+          key: twrp16-sm87xx
+          max-size: 5G
+          create-symlink: true
+
+      - name: Configure zram
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" zram-tools
+          sudo modprobe zram
+          sudo sed -i 's/^#\?PERCENT=.*/PERCENT=90/' /etc/default/zramswap
+          sudo sed -i 's/^#\?PRIORITY=.*/PRIORITY=1000/' /etc/default/zramswap
+          sudo systemctl restart zramswap
+          zramctl
+
+      - name: Install repo launcher
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get install -y repo
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Initialize and pin TWRP 16 manifest
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/source"
+          cd "$GITHUB_WORKSPACE/source"
+          repo init \
+            --depth=1 \
+            --no-clone-bundle \
+            -u "$MANIFEST_URL" \
+            -b "$MANIFEST_BRANCH"
+
+          # Keep repo's local "default" branch checked out. Detaching HEAD here
+          # makes repo lose the manifest branch and fall back to "master".
+          test "$(git -C .repo/manifests branch --show-current)" = "default"
+          test "$(git -C .repo/manifests rev-parse HEAD)" = "$MANIFEST_COMMIT"
+
+      - name: Sync TWRP source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/source"
+          repo sync \
+            --current-branch \
+            --force-sync \
+            --no-clone-bundle \
+            --no-tags \
+            --retry-fetches=3 \
+            -j"$(nproc)"
+          test "$(git -C .repo/manifests rev-parse HEAD)" = "$MANIFEST_COMMIT"
+
+      - name: Pin and patch TWRP vold decryption
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/source"
+          git -C system/vold fetch --depth=1 origin "$VOLD_COMMIT"
+          git -C system/vold checkout --detach "$VOLD_COMMIT"
+          test "$(git -C system/vold rev-parse HEAD)" = "$VOLD_COMMIT"
+
+          patch="$GITHUB_WORKSPACE/patches/twrp-vold-data-decryption.patch"
+          git -C system/vold apply --check "$patch"
+          git -C system/vold apply "$patch"
+          git -C system/vold diff --check
+          git -C system/vold apply --reverse --check "$patch"
+
+          grep -Fq 'Keystore database reload complete' system/vold/Decrypt.cpp
+          grep -Fq 'Invalid weaver data size' system/vold/Decrypt.cpp
+          grep -Fq 'Waiting for Weaver config' system/vold/Weaver1.cpp
+
+      - name: Fetch and verify Turbo 6 device tree
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/source"
+          git clone --depth=2 --branch "$DEVICE_TREE_BRANCH" \
+            "$DEVICE_TREE_URL" "$DEVICE_PATH"
+          git -C "$DEVICE_PATH" fetch --depth=2 origin "$DEVICE_TREE_COMMIT"
+          git -C "$DEVICE_PATH" checkout --detach "$DEVICE_TREE_COMMIT"
+
+          test "$(git -C "$DEVICE_PATH" rev-parse HEAD)" = "$DEVICE_TREE_COMMIT"
+          git -C "$DEVICE_PATH" merge-base --is-ancestor \
+            "$TURBO6_TOUCH_COMMIT" "$DEVICE_TREE_COMMIT"
+          grep -Fq "OnePlus Turbo 6 (CN)" "$DEVICE_PATH/README.md"
+
+          patch="$GITHUB_WORKSPACE/patches/device-tree-crypto-init.patch"
+          git -C "$DEVICE_PATH" apply --check "$patch"
+          git -C "$DEVICE_PATH" apply "$patch"
+          git -C "$DEVICE_PATH" diff --check
+          git -C "$DEVICE_PATH" apply --reverse --check "$patch"
+          grep -Fq 'Restarting KeyMint and keystore2' \
+            "$DEVICE_PATH/recovery/root/vendor/bin/override-spl.sh"
+
+      - name: Record exact source revisions
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/source"
+          repo manifest -r -o pinned-manifest.xml
+          {
+            echo "Device: OnePlus Turbo 6 CN (PLU110, volkswagen/vw)"
+            echo "Android/TWRP branch: twrp-16.0"
+            echo "Manifest commit: $MANIFEST_COMMIT"
+            echo "system/vold commit: $VOLD_COMMIT"
+            echo "Device tree commit: $DEVICE_TREE_COMMIT"
+            echo "Turbo 6 touch support commit: $TURBO6_TOUCH_COMMIT"
+            echo "vold decryption patch SHA-256: $(sha256sum "$GITHUB_WORKSPACE/patches/twrp-vold-data-decryption.patch" | cut -d' ' -f1)"
+            echo "device crypto-init patch SHA-256: $(sha256sum "$GITHUB_WORKSPACE/patches/device-tree-crypto-init.patch" | cut -d' ' -f1)"
+            echo "GitHub run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Build started (UTC): $(date -u --iso-8601=seconds)"
+          } > BUILD_INFO.txt
 
       - name: Build TWRP recovery image
         shell: bash
@@ -76,28 +194,25 @@ jobs:
           ccache -M 5G
 
           lunch "$LUNCH_TARGET"
-          # 用 input 控制构建目标，默认 recoveryimage
-          m "${{ github.event.inputs.BUILD_PARTITION || 'recovery' }}image"
+          m "${BUILD_PARTITION}image"
 
       - name: Validate and stage output
         shell: bash
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/source"
-          partition="${{ github.event.inputs.BUILD_PARTITION || 'recovery' }}"
-          image="out/target/product/$PRODUCT_NAME/${partition}.img"
+          image="out/target/product/$PRODUCT_NAME/${BUILD_PARTITION}.img"
           test -s "$image"
 
-          # recovery 分区大小校验仅在 recovery 时执行
-          if [ "$partition" = "recovery" ]; then
+          # The device tree declares a 0x6400000-byte recovery partition.
+          if [ "$BUILD_PARTITION" = "recovery" ]; then
             test "$(stat -c '%s' "$image")" -le 104857600
           fi
           file "$image" | grep -Fq "Android bootimg"
 
           output="$GITHUB_WORKSPACE/artifacts"
           mkdir -p "$output"
-          device_name="${{ github.event.inputs.DEVICE_NAME || 'sm87xx' }}"
-          name="TWRP-3.7.1-16-${device_name}-PLU110-${GITHUB_RUN_ID}.img"
+          name="TWRP-3.7.1-16-${DEVICE_NAME}-PLU110-${GITHUB_RUN_ID}.img"
           cp "$image" "$output/$name"
           cp BUILD_INFO.txt pinned-manifest.xml "$output/"
           cp "$GITHUB_WORKSPACE"/patches/*.patch "$output/"
@@ -117,11 +232,11 @@ jobs:
           retention-days: 14
 
       - name: Upload to Release
-        if: ${{ github.event.inputs.SHOULD_RELEASE == 'true' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && env.SHOULD_RELEASE == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*.img
-          name: TWRP-3.7.1-16-${{ github.event.inputs.DEVICE_NAME || 'sm87xx' }}-${{ github.run_id }}
+          name: TWRP-3.7.1-16-${{ env.DEVICE_NAME }}-${{ github.run_id }}
           tag_name: ${{ github.run_id }}
           body_path: artifacts/BUILD_INFO.txt
         env:
