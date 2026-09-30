@@ -1,4 +1,4 @@
-name: Build TWRP 16 for OnePlus Turbo 6 (sm87xx)
+name: Build TWRP 16 for OnePlus Turbo 6
 
 on:
   workflow_dispatch:
