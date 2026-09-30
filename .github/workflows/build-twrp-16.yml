@@ -37,7 +37,6 @@ jobs:
     env:
       MANIFEST_URL: https://github.com/TWRP-Test/platform_manifest_twrp_aosp.git
       MANIFEST_BRANCH: twrp-16.0
-      MANIFEST_COMMIT: 512614e74d5a65f7b11fbd0b424f0d68b5ef7fe1
       VOLD_COMMIT: 953de9608eb78380b3c4e39e801c2bc0af7dbddc
       DEVICE_TREE_URL: https://github.com/ciyuzhou/twrp_device_oplus_sm87xx.git
       DEVICE_TREE_BRANCH: twrp-16.0
@@ -88,7 +87,7 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Initialize and pin TWRP 16 manifest
+      - name: Initialize TWRP 16 manifest
         shell: bash
         run: |
           set -euxo pipefail
@@ -100,10 +99,10 @@ jobs:
             -u "$MANIFEST_URL" \
             -b "$MANIFEST_BRANCH"
 
-          # Keep repo's local "default" branch checked out. Detaching HEAD here
-          # makes repo lose the manifest branch and fall back to "master".
-          test "$(git -C .repo/manifests branch --show-current)" = "default"
-          test "$(git -C .repo/manifests rev-parse HEAD)" = "$MANIFEST_COMMIT"
+          # 记录实际拿到的 manifest commit，便于在 BUILD_INFO 里追溯
+          MANIFEST_ACTUAL_COMMIT="$(git -C .repo/manifests rev-parse HEAD)"
+          echo "MANIFEST_ACTUAL_COMMIT=$MANIFEST_ACTUAL_COMMIT" >> "$GITHUB_ENV"
+          echo "Manifest actual commit: $MANIFEST_ACTUAL_COMMIT"
 
       - name: Sync TWRP source
         shell: bash
@@ -117,7 +116,6 @@ jobs:
             --no-tags \
             --retry-fetches=3 \
             -j"$(nproc)"
-          test "$(git -C .repo/manifests rev-parse HEAD)" = "$MANIFEST_COMMIT"
 
       - name: Pin and patch TWRP vold decryption
         shell: bash
@@ -170,7 +168,7 @@ jobs:
           {
             echo "Device: OnePlus Turbo 6 CN (PLU110, volkswagen/vw)"
             echo "Android/TWRP branch: twrp-16.0"
-            echo "Manifest commit: $MANIFEST_COMMIT"
+            echo "Manifest commit (actual): $MANIFEST_ACTUAL_COMMIT"
             echo "system/vold commit: $VOLD_COMMIT"
             echo "Device tree commit: $DEVICE_TREE_COMMIT"
             echo "Turbo 6 touch support commit: $TURBO6_TOUCH_COMMIT"
